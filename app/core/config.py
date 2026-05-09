@@ -11,6 +11,10 @@ class Settings(BaseModel):
     llm_text_token_budget: int = 500
     duplicate_hamming_threshold: int = 5
     minimum_auto_classification_confidence: float = 0.82
+    max_pdf_pages: int = 2_000
+    native_text_minimum_chars: int = 20
+    pdf_render_dpi: int = 120
+    ocr_render_dpi: int = 200
 
 
 @lru_cache

@@ -6,14 +6,14 @@ ordered, and validated document records while minimizing LLM cost.
 ## Pipeline Overview
 
 ```text
-PDF Ingest → Pre-processing → Classification → Duplicate Detection → Grouping & Ordering → Validation → Output
+PDF Upload → Page Ingestion → Pre-processing → Classification → Duplicate Detection → Grouping & Ordering → Validation → Output
 ```
 
 ## Recommended Stack
 
 | Layer | Choice | Why |
 | --- | --- | --- |
-| API | FastAPI | Async-ready Python API, OpenAPI docs, simple deployment surface. |
+| API | FastAPI | Async-ready Python API, upload support, OpenAPI docs, simple deployment surface. |
 | PDF parsing | PyMuPDF (`fitz`) | Fast page splitting, native text extraction, page rendering. |
 | OCR | Tesseract via `pytesseract` | Local, low-cost OCR for scanned pages. |
 | Image hashing | `imagehash`/Pillow | Perceptual hash for exact and near-duplicate detection. |
@@ -23,12 +23,17 @@ PDF Ingest → Pre-processing → Classification → Duplicate Detection → Gro
 
 ## Implemented Proof-of-Architecture
 
-This repository now includes a deterministic service skeleton that can run without external LLM
-credentials:
+This repository now includes a deterministic service skeleton with both text-snippet and PDF upload
+entrypoints:
 
 - `app/main.py` starts the FastAPI app.
-- `app/api/routes.py` exposes `GET /health` and `POST /packages/process-text` for text-snippet
-  proof-of-processing.
+- `app/api/routes.py` exposes:
+  - `GET /health`
+  - `POST /packages/process-text` for text-snippet proof-of-processing
+  - `POST /packages/process-pdf` for multipart PDF uploads
+- `app/services/ingestion.py` opens PDFs with PyMuPDF, extracts native text and bounding boxes,
+  renders page images for perceptual hashes, falls back to local Tesseract OCR for scanned pages,
+  and emits non-fatal ingestion exceptions.
 - `app/models.py` defines the page, classification, duplicate, document, exception, and package
   output contracts.
 - `app/pipeline/classification.py` implements the cost-saving cascade:
@@ -42,20 +47,58 @@ credentials:
   missing signatures, and duplicates.
 - `app/pipeline/processor.py` orchestrates the end-to-end post-ingestion pipeline.
 
+## End-to-End Protocol
+
+The design follows the case-study constraints: do not trust file names, do not assume pages are
+machine-readable, avoid unnecessary LLM calls, handle unseen packages, and prefer partial output with
+specific exceptions over crashes.
+
+| Stage | Objective | Logic / Algorithm | Tools | Cost and Latency Control |
+| --- | --- | --- | --- | --- |
+| 1. PDF upload | Accept a raw, randomly ordered mortgage bundle. | `POST /packages/process-pdf` accepts multipart uploads and optional `package_id`; file name is used only as a fallback identifier, never as a classification signal. | FastAPI `UploadFile`, Pydantic response model. | Streaming upload interface; reject empty/non-PDF-looking uploads before processing. |
+| 2. Page ingestion and pre-processing | Normalize up to 2,000 PDF pages into independent page records. | Open with PyMuPDF, inspect each page, extract native text and bounding boxes, render page image, compute pHash. If native text is too sparse, render at OCR DPI and run Tesseract. Page failures become `exceptions[]`. | PyMuPDF, Pillow, imagehash, Tesseract. | Native text path avoids OCR; local OCR has zero LLM cost; configurable page limit and render DPI. |
+| 3. Lightweight classification | Classify obvious pages without an LLM. | Regex/keyword rules identify 1003, bank statements, W-2, 1040, paystubs, and closing disclosures. A sklearn adapter is the second-pass boundary for TF-IDF + Logistic Regression. | Python regex, scikit-learn adapter. | Free deterministic pass first; only low-confidence pages continue. |
+| 4. Targeted LLM classification | Resolve ambiguous pages only. | Batch unresolved page-text snippets, truncate to configured token budget, and return structured classifications. Current adapter is a production integration seam. | Claude/GPT-class structured output provider. | Text-only snippets, batch size 10, first 500 tokens, pHash-based cache-ready boundary. |
+| 5. Duplicate detection | Flag exact and near-duplicate pages. | Compare pHashes with Hamming distance; group near matches and keep the highest-quality page as canonical. | imagehash, Python bit operations. | Hash comparisons are cheap; avoids duplicate LLM/classification work in production cache. |
+| 6. Grouping and ordering | Assemble document records from random page order. | Group by `doc_type`, sort by `Page X of Y` counters when present, otherwise preserve package order; extract bank statement period when present. | Pydantic models, regex. | Lightweight deterministic ordering before any semantic embedding enhancement. |
+| 7. Validation | Detect completeness and quality problems. | Required document checks, page-counter gaps, signature cues, duplicate-page exceptions. | Config-driven Python validators. | Non-crashing validation preserves partial output and flags review work. |
+| 8. Output | Return structured decisioning payload. | Return `documents[]`, `exceptions[]`, and `duplicate_groups[]`. | FastAPI JSON response. | Client receives usable partial results even if OCR/page extraction fails. |
+
+## Upload PDF API
+
+Run the API:
+
+```bash
+uvicorn app.main:app --reload
+```
+
+Upload a mortgage PDF bundle:
+
+```bash
+curl -X POST http://127.0.0.1:8000/packages/process-pdf \
+  -F 'package_id=PKG-20240509-001' \
+  -F 'file=@/path/to/mortgage-package.pdf;type=application/pdf'
+```
+
+The response uses the same output contract as the text endpoint. Ingestion exceptions such as
+`ocr_failed`, `page_ingestion_failed`, or `pdf_page_limit_exceeded` are prepended to pipeline
+exceptions so downstream review sees exactly what degraded.
+
 ## Stage 1: Ingestion & Pre-processing
 
 **Objective:** Normalize raw PDFs into processable page units.
 
-Planned production ingestion should:
+Implemented PDF ingestion:
 
 1. Split PDFs into individual pages with PyMuPDF.
-2. Detect native digital pages by checking selectable text.
+2. Detect native digital pages by checking extracted text length.
 3. OCR scanned image pages with local Tesseract.
 4. Extract text and bounding boxes into the `Page` model.
 5. Generate a perceptual hash (`phash`) for duplicate detection.
+6. Continue past recoverable page/OCR failures by appending exception records.
 
-The current `app/services/ingestion.py` includes a text-snippet helper so the rest of the pipeline can
-be exercised before PDF infrastructure is wired in.
+The `app/services/ingestion.py` text-snippet helper remains available for fast unit tests and local
+pipeline demos before using real PDF files.
 
 ## Stage 2: Lightweight Classification — No LLM
 
@@ -148,7 +191,7 @@ Run the API:
 uvicorn app.main:app --reload
 ```
 
-Example request:
+Example text-only request:
 
 ```bash
 curl -X POST http://127.0.0.1:8000/packages/process-text \
